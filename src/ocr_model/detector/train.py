@@ -1,218 +1,158 @@
-import os
-import json
-import argparse
-from pathlib import Path
-from typing import List, Dict, Any
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import argparse
+from pathlib import Path
+from typing import Dict, Any
 
 from ocr_model.config.config import Config
-from ocr_model.utils.data_utils import OCRDataset, collate_fn
-from ocr_model.detector.model import TextDetector
+from ocr_model.utils.data_utils import create_data_loaders
+from ocr_model.detector.model import DBNetPP
 
-def train_detector(config: Config, is_test: bool = False):
-    # Initialize tensorboard
+def train_detector(config: Config, is_test: bool = False) -> None:
+    """
+    DBNet++ 모델 학습 함수
+    
+    Args:
+        config: 설정 객체
+        is_test: 테스트 모드 여부
+    """
+    # TensorBoard 설정
     writer = SummaryWriter(config.log_dir / "detector")
     
-    # Set device
-    device = torch.device(config.detector.device)
+    # 데이터 로더 생성
+    train_loader, val_loader, test_loader = create_data_loaders(config)
     
-    # Create dataset and dataloader
-    train_dataset = OCRDataset(
-        Path(config.data.predata_dir),
-        config,
-        is_train=True,
-        is_test=is_test
-    )
-    val_dataset = OCRDataset(
-        Path(config.data.predata_dir),
-        config,
-        is_train=False,
-        is_test=is_test
-    )
+    # 모델 초기화
+    model = DBNetPP(config).to(config.detector.device)
     
-    batch_size = config.test.test_batch_size if is_test else config.detector.batch_size
-    num_epochs = config.test.test_epochs if is_test else config.detector.num_epochs
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        collate_fn=collate_fn
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=config.num_workers,
-        collate_fn=collate_fn
-    )
-    
-    print(f"Test Mode: {is_test}")
-    print(f"Train Dataset Size: {len(train_dataset)}")
-    print(f"Val Dataset Size: {len(val_dataset)}")
-    print(f"Batch Size: {batch_size}")
-    print(f"Epochs: {num_epochs}")
-    
-    # Create model
-    model = TextDetector(config.detector).to(device)
-    
-    # Create optimizer and scheduler
+    # 옵티마이저 설정
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config.detector.learning_rate,
         weight_decay=config.detector.weight_decay
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    
+    # 스케줄러 설정
+    scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        T_max=num_epochs,
-        eta_min=config.detector.learning_rate * 0.1
+        max_lr=config.detector.learning_rate,
+        epochs=config.detector.num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=config.detector.warmup_epochs / config.detector.num_epochs
     )
     
-    # Create loss functions
-    region_criterion = nn.BCEWithLogitsLoss()
-    affinity_criterion = nn.BCEWithLogitsLoss()
-    detection_criterion = nn.BCEWithLogitsLoss()
+    # 손실 함수
+    criterion = nn.BCEWithLogitsLoss()
     
-    # Training loop
-    best_val_loss = float('inf')
-    for epoch in range(num_epochs):
-        # Train
+    # 최적 모델 저장 경로
+    best_model_path = config.checkpoint_dir / "detector_best.pth"
+    
+    # 학습 루프
+    best_val_loss = float("inf")
+    for epoch in range(config.detector.num_epochs):
+        # 학습
         model.train()
-        train_loss = 0
-        train_region_loss = 0
-        train_affinity_loss = 0
-        train_detection_loss = 0
+        train_loss = 0.0
+        train_steps = 0
         
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
-        for batch in pbar:
-            # Move data to device
-            images = batch["images"].to(device)
-            region_maps = batch["region_maps"].unsqueeze(1).to(device)
-            affinity_maps = batch["affinity_maps"].unsqueeze(1).to(device)
-            detection_maps = batch["detection_maps"].unsqueeze(1).to(device)
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.detector.num_epochs} [Train]"):
+            # 데이터 이동
+            detector_images = batch["detector_images"].to(config.detector.device)
+            region_maps = batch["region_maps"].to(config.detector.device)
+            affinity_maps = batch["affinity_maps"].to(config.detector.device)
+            detection_maps = batch["detection_maps"].to(config.detector.device)
             
-            # Forward pass
-            outputs = model(images)
+            # 순전파
+            outputs = model(detector_images)
+            probability_map = outputs["probability_map"]
+            threshold_map = outputs["threshold_map"]
             
-            # Calculate losses
-            region_loss = region_criterion(outputs.craft_outputs["region_score"], region_maps)
-            affinity_loss = affinity_criterion(outputs.craft_outputs["affinity_score"], affinity_maps)
-            detection_loss = detection_criterion(outputs.craft_outputs["detection"], detection_maps)
-            loss = region_loss + affinity_loss + detection_loss
+            # 손실 계산
+            prob_loss = criterion(probability_map, detection_maps)
+            thresh_loss = criterion(threshold_map, detection_maps)
+            loss = prob_loss + thresh_loss
             
-            # Backward pass
+            # 역전파
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
             
-            # Update metrics
+            # 통계 업데이트
             train_loss += loss.item()
-            train_region_loss += region_loss.item()
-            train_affinity_loss += affinity_loss.item()
-            train_detection_loss += detection_loss.item()
+            train_steps += 1
             
-            pbar.set_postfix({
-                "loss": loss.item(),
-                "region_loss": region_loss.item(),
-                "affinity_loss": affinity_loss.item(),
-                "detection_loss": detection_loss.item()
-            })
+            if is_test and train_steps >= 10:
+                break
         
-        # Update learning rate
-        scheduler.step()
-        
-        # Calculate average losses
-        train_loss /= len(train_loader)
-        train_region_loss /= len(train_loader)
-        train_affinity_loss /= len(train_loader)
-        train_detection_loss /= len(train_loader)
-        
-        # Validate
+        # 검증
         model.eval()
-        val_loss = 0
-        val_region_loss = 0
-        val_affinity_loss = 0
-        val_detection_loss = 0
+        val_loss = 0.0
+        val_steps = 0
         
         with torch.no_grad():
-            for batch in val_loader:
-                # Move data to device
-                images = batch["images"].to(device)
-                region_maps = batch["region_maps"].unsqueeze(1).to(device)
-                affinity_maps = batch["affinity_maps"].unsqueeze(1).to(device)
-                detection_maps = batch["detection_maps"].unsqueeze(1).to(device)
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{config.detector.num_epochs} [Val]"):
+                # 데이터 이동
+                detector_images = batch["detector_images"].to(config.detector.device)
+                region_maps = batch["region_maps"].to(config.detector.device)
+                affinity_maps = batch["affinity_maps"].to(config.detector.device)
+                detection_maps = batch["detection_maps"].to(config.detector.device)
                 
-                # Forward pass
-                outputs = model(images)
+                # 순전파
+                outputs = model(detector_images)
+                probability_map = outputs["probability_map"]
+                threshold_map = outputs["threshold_map"]
                 
-                # Calculate losses
-                region_loss = region_criterion(outputs.craft_outputs["region_score"], region_maps)
-                affinity_loss = affinity_criterion(outputs.craft_outputs["affinity_score"], affinity_maps)
-                detection_loss = detection_criterion(outputs.craft_outputs["detection"], detection_maps)
-                loss = region_loss + affinity_loss + detection_loss
+                # 손실 계산
+                prob_loss = criterion(probability_map, detection_maps)
+                thresh_loss = criterion(threshold_map, detection_maps)
+                loss = prob_loss + thresh_loss
                 
-                # Update metrics
+                # 통계 업데이트
                 val_loss += loss.item()
-                val_region_loss += region_loss.item()
-                val_affinity_loss += affinity_loss.item()
-                val_detection_loss += detection_loss.item()
+                val_steps += 1
+                
+                if is_test and val_steps >= 10:
+                    break
         
-        # Calculate average losses
-        val_loss /= len(val_loader)
-        val_region_loss /= len(val_loader)
-        val_affinity_loss /= len(val_loader)
-        val_detection_loss /= len(val_loader)
+        # 평균 손실 계산
+        train_loss /= train_steps
+        val_loss /= val_steps
         
-        # Log metrics to tensorboard
-        writer.add_scalar('Loss/train', train_loss, epoch)
-        writer.add_scalar('Loss/val', val_loss, epoch)
-        writer.add_scalar('Region_Loss/train', train_region_loss, epoch)
-        writer.add_scalar('Region_Loss/val', val_region_loss, epoch)
-        writer.add_scalar('Affinity_Loss/train', train_affinity_loss, epoch)
-        writer.add_scalar('Affinity_Loss/val', val_affinity_loss, epoch)
-        writer.add_scalar('Detection_Loss/train', train_detection_loss, epoch)
-        writer.add_scalar('Detection_Loss/val', val_detection_loss, epoch)
-        writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], epoch)
+        # TensorBoard 로깅
+        writer.add_scalar("Loss/train", train_loss, epoch)
+        writer.add_scalar("Loss/val", val_loss, epoch)
+        writer.add_scalar("Learning Rate", scheduler.get_last_lr()[0], epoch)
         
-        # Save best model
+        # 최적 모델 저장
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(
-                model.state_dict(),
-                config.checkpoint_dir / "detector_best.pth"
-            )
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "train_loss": train_loss,
+                "val_loss": val_loss
+            }, best_model_path)
         
-        print(f"Epoch {epoch + 1}/{num_epochs}")
+        print(f"Epoch {epoch + 1}/{config.detector.num_epochs}")
         print(f"Train Loss: {train_loss:.4f}")
         print(f"Val Loss: {val_loss:.4f}")
-        print(f"Best Val Loss: {best_val_loss:.4f}")
+        print(f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
         print("-" * 50)
     
     writer.close()
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="config.json", help="Path to config file")
-    parser.add_argument("--test", action="store_true", help="Run in test mode")
+    parser.add_argument("--test", action="store_true", help="테스트 모드 실행")
     args = parser.parse_args()
     
     config = Config()
-    if os.path.exists(args.config):
-        with open(args.config, "r") as f:
-            config_dict = json.load(f)
-            # TODO: config_dict를 Config 객체로 변환
-    
-    # Create checkpoint directory
-    os.makedirs(config.checkpoint_dir, exist_ok=True)
-    
     train_detector(config, is_test=args.test)
 
 if __name__ == "__main__":

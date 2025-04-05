@@ -1,176 +1,145 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ..config.config import DetectorConfig
+from typing import Tuple, Dict, Any
+from ..config.config import Config
 
-class CRAFT(nn.Module):
-    def __init__(self, pretrained: str = None):
+class FPN(nn.Module):
+    def __init__(self, in_channels: Tuple[int, ...], out_channels: int):
         super().__init__()
+        self.lateral_convs = nn.ModuleList()
+        self.fpn_convs = nn.ModuleList()
         
-        # VGG16 기반의 백본
-        self.backbone = nn.Sequential(
-            # Block 1
-            nn.Conv2d(3, 64, 3, padding=1),
+        for in_channel in in_channels:
+            self.lateral_convs.append(
+                nn.Conv2d(in_channel, out_channels, 1)
+            )
+            self.fpn_convs.append(
+                nn.Conv2d(out_channels, out_channels, 3, padding=1)
+            )
+        
+    def forward(self, features: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, ...]:
+        laterals = [
+            lateral_conv(feature)
+            for lateral_conv, feature in zip(self.lateral_convs, features)
+        ]
+        
+        # Top-down path
+        used_backbone_levels = len(laterals)
+        for i in range(used_backbone_levels - 1, 0, -1):
+            laterals[i - 1] += F.interpolate(
+                laterals[i], scale_factor=2, mode="nearest"
+            )
+        
+        # Build outputs
+        outs = [
+            self.fpn_convs[i](laterals[i])
+            for i in range(used_backbone_levels)
+        ]
+        
+        return tuple(outs)
+
+class ASF(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv2d(channels, channels, 1)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, features: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        # Global average pooling
+        global_features = [
+            self.global_avg_pool(feature)
+            for feature in features
+        ]
+        
+        # Channel attention
+        attention_weights = [
+            self.sigmoid(self.conv(feature))
+            for feature in global_features
+        ]
+        
+        # Weighted sum
+        weighted_features = [
+            feature * weight
+            for feature, weight in zip(features, attention_weights)
+        ]
+        
+        # Sum all features
+        fused_features = sum(weighted_features)
+        
+        return fused_features
+
+class DetectionHead(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.probability_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 4, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 4),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 3, padding=1),
+            nn.ConvTranspose2d(in_channels // 4, in_channels // 4, 2, stride=2),
+            nn.BatchNorm2d(in_channels // 4),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            
-            # Block 2
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            
-            # Block 3
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            
-            # Block 4
-            nn.Conv2d(256, 512, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            
-            # Block 5
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.ReLU(inplace=True)
+            nn.Conv2d(in_channels // 4, 1, 1)
         )
+        
+        self.threshold_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 4, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(in_channels // 4, in_channels // 4, 2, stride=2),
+            nn.BatchNorm2d(in_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 4, 1, 1)
+        )
+        
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        probability = self.probability_head(x)
+        threshold = self.threshold_head(x)
+        return probability, threshold
+
+class DBNetPP(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+        
+        # Backbone
+        if config.detector.backbone == "resnet50":
+            self.backbone = torch.hub.load(
+                'pytorch/vision:v0.10.0',
+                'resnet50',
+                pretrained=config.detector.pretrained
+            )
+            self.backbone = nn.Sequential(
+                *list(self.backbone.children())[:-2]
+            )
         
         # FPN
-        self.fpn = nn.ModuleDict({
-            'p5': nn.Conv2d(512, 256, 1),
-            'p4': nn.Conv2d(512, 256, 1),
-            'p3': nn.Conv2d(256, 256, 1),
-            'p2': nn.Conv2d(128, 256, 1)
-        })
-        
-        # Detection head
-        self.detection_head = nn.Sequential(
-            nn.Conv2d(256, 128, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 64, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, 1)
+        self.fpn = FPN(
+            config.detector.fpn_in_channels,
+            config.detector.fpn_out_channels
         )
         
-        # Region score head
-        self.region_head = nn.Sequential(
-            nn.Conv2d(256, 128, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 64, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, 1)
-        )
+        # ASF
+        self.asf = ASF(config.detector.asf_channels)
         
-        # Affinity score head
-        self.affinity_head = nn.Sequential(
-            nn.Conv2d(256, 128, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 64, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, 1)
-        )
+        # Detection Head
+        self.detection_head = DetectionHead(config.detector.asf_channels)
         
-        # 가중치 초기화
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-    
-    def forward(self, x):
-        # Backbone features
-        c2 = self.backbone[:10](x)
-        c3 = self.backbone[10:17](c2)
-        c4 = self.backbone[17:24](c3)
-        c5 = self.backbone[24:](c4)
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # Backbone
+        features = self.backbone(x)
         
-        # FPN features
-        p5 = self.fpn['p5'](c5)
-        p4 = self.fpn['p4'](c4) + F.interpolate(p5, size=c4.shape[2:], mode='nearest')
-        p3 = self.fpn['p3'](c3) + F.interpolate(p4, size=c3.shape[2:], mode='nearest')
-        p2 = self.fpn['p2'](c2) + F.interpolate(p3, size=c2.shape[2:], mode='nearest')
+        # FPN
+        fpn_features = self.fpn(features)
         
-        # Final feature map
-        features = F.interpolate(p2, size=x.shape[2:], mode='nearest')
+        # ASF
+        fused_features = self.asf(fpn_features)
         
-        # Detection outputs
-        detection = self.detection_head(features)
-        region_score = self.region_head(features)
-        affinity_score = self.affinity_head(features)
+        # Detection
+        probability_map, threshold_map = self.detection_head(fused_features)
         
         return {
-            'detection': detection,
-            'region_score': region_score,
-            'affinity_score': affinity_score,
-            'features': features
-        }
-
-class TextDetector(nn.Module):
-    def __init__(self, config: DetectorConfig):
-        super().__init__()
-        
-        # CRAFT 모델 초기화
-        self.craft = CRAFT(config.craft_pretrained)
-        
-        # 특징 차원 변환
-        self.feature_proj = nn.Conv2d(256, config.transformer_hidden_dim, 1)
-        
-        # Transformer 레이어
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.transformer_hidden_dim,
-            nhead=config.transformer_num_heads,
-            dim_feedforward=config.transformer_ff_dim,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=config.transformer_num_layers
-        )
-        
-        # 출력 레이어
-        self.score_head = nn.Linear(config.transformer_hidden_dim, 1)
-        self.box_head = nn.Linear(config.transformer_hidden_dim, 4)
-    
-    def forward(self, images):
-        # CRAFT forward pass
-        craft_outputs = self.craft(images)
-        
-        # Get features and project to transformer dimension
-        features = craft_outputs["features"]
-        features = self.feature_proj(features)
-        
-        # Transformer encoding
-        B, C, H, W = features.shape
-        features = features.view(B, C, -1).permute(0, 2, 1)
-        features = self.transformer(features)
-        
-        # Prediction heads
-        scores = self.score_head(features)
-        boxes = self.box_head(features)
-        
-        return type('Outputs', (), {
-            'logits': scores.squeeze(-1),
-            'pred_boxes': boxes.view(B, -1, 4),
-            'craft_outputs': craft_outputs
-        }) 
+            "probability_map": probability_map,
+            "threshold_map": threshold_map
+        } 
