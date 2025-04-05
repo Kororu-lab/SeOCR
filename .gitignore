@@ -2,6 +2,7 @@
 data/*
 predata/
 predata_backup/
+model_init/
 
 # But keep the README
 !data/README.md
