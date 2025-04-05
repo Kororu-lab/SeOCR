@@ -56,15 +56,32 @@ class TestConfig:
     test_epochs: int = 2        # 테스트용 에포크 수
 
 @dataclass
+class ClassifierConfig:
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-4
+    num_epochs: int = 100
+    batch_size: int = 32
+    image_size: Tuple[int, int] = (224, 224)
+    num_classes: int = 0  # Will be set based on the dataset
+    char_to_idx: dict = None  # Will be initialized during dataset creation
+    idx_to_char: dict = None  # Will be initialized during dataset creation
+
+@dataclass
 class Config:
     detector: DetectorConfig = DetectorConfig()
     data: DataConfig = DataConfig()
     test: TestConfig = TestConfig()
     data_source: DataSourceConfig = DataSourceConfig()
+    classifier: ClassifierConfig = ClassifierConfig()
     
     # 공통 설정
     device: str = "cuda"  # 또는 "cpu"
     num_workers: int = 4
     seed: int = 42
     log_dir: Path = Path("logs")
-    checkpoint_dir: Path = Path("checkpoints") 
+    checkpoint_dir: Path = Path("checkpoints")
+    
+    def __post_init__(self):
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True) 
