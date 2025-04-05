@@ -1,0 +1,124 @@
+# Ignore data directories
+data/*
+predata/
+predata_backup/
+
+# But keep the README
+!data/README.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.env
+.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Logs
+*.log
+wandb/
+
+# Environment variables
+.env
+
+# Model checkpoints
+seocr_checkpoints/
+
+# Logs and databases
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Model files
+*.pt
+*.pth
+*.h5
+*.ckpt
+*.bin
+.cache/
+
+# Config and secrets
+config.ini
+secrets.json
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Test coverage
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Git
+.git/
+.gitattributes
+
+# Project specific
+*.onnx
+*.engine
+
+# Tensorboard
+events.out.tfevents.*
+
+# Documentation
+docs/_build/
+site/
+
+# Misc
+*.csv
+*.json
+*.txt
+!requirements.txt
+!README.md
+!LICENSE 
